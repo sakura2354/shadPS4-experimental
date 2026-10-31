@@ -412,15 +412,32 @@ static std::optional<u32> TryEvaluateConstU32(IR::Value value, u32 depth = 0) {
 }
 
 // A phi over differing constants leaves the factor selection to runtime. The compiled shader cannot
-// express that with compile-time IR::Patch indices, so fall back to the first resolvable edge and
-// let the caller report the approximation.
-static std::optional<u32> TryPickFirstResolvableEdge(IR::Value value) {
+// express that with compile-time IR::Patch indices, so fall back to the edge whose offset lands
+// inside the factor block of the active domain. Hull shaders emit their factors as a run of
+// consecutive dwords whose base the phi selects, so only one edge can start a valid factor block.
+static u32 MaxTessFactorCount(AmdGpu::TessellationType type) {
+    switch (type) {
+    case AmdGpu::TessellationType::Isoline:
+        return 2;
+    case AmdGpu::TessellationType::Triangle:
+        return 4;
+    case AmdGpu::TessellationType::Quad:
+        return 6;
+    default:
+        return 0;
+    }
+}
+
+static std::optional<u32> TryPickResolvableFactorEdge(IR::Value value, u32 inst_offset,
+                                                      AmdGpu::TessellationType tess_type) {
     const IR::Inst* inst = value.TryInst();
     if (inst == nullptr || inst->GetOpcode() != IR::Opcode::Phi) {
         return std::nullopt;
     }
+    const u32 factor_count = MaxTessFactorCount(tess_type);
     for (size_t i = 0; i < inst->NumArgs(); i++) {
-        if (const auto v = TryEvaluateConstU32(inst->Arg(i))) {
+        const auto v = TryEvaluateConstU32(inst->Arg(i));
+        if (v && ((inst_offset + *v) >> 2) < factor_count) {
             return v;
         }
     }
@@ -513,11 +530,13 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                     }
                 }
                 if (!voffset_value) {
-                    voffset_value = TryPickFirstResolvableEdge(IR::GetBufferVOffsetArg(&inst));
+                    voffset_value = TryPickResolvableFactorEdge(IR::GetBufferVOffsetArg(&inst),
+                                                                info.inst_offset.Value(),
+                                                                runtime_info.sw.tcs.tess_type);
                     if (voffset_value) {
                         LOG_WARNING(Render_Recompiler,
-                                    "Approximating runtime tessellation factor selection with "
-                                    "offset {} (tess_type={})",
+                                    "Runtime tessellation factor selection is not representable; "
+                                    "using the in-range edge with offset {} (tess_type={})",
                                     *voffset_value,
                                     static_cast<u32>(runtime_info.sw.tcs.tess_type));
                     }
