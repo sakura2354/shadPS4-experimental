@@ -394,9 +394,37 @@ static std::optional<u32> TryEvaluateConstU32(IR::Value value, u32 depth = 0) {
         }
         return std::nullopt;
     }
+    case IR::Opcode::Phi: {
+        // Only a phi whose every incoming edge agrees is a compile-time constant.
+        std::optional<u32> result;
+        for (size_t i = 0; i < inst->NumArgs(); i++) {
+            const auto v = eval(inst->Arg(i));
+            if (!v || (result && *result != *v)) {
+                return std::nullopt;
+            }
+            result = v;
+        }
+        return result;
+    }
     default:
         return std::nullopt;
     }
+}
+
+// A phi over differing constants leaves the factor selection to runtime. The compiled shader cannot
+// express that with compile-time IR::Patch indices, so fall back to the first resolvable edge and
+// let the caller report the approximation.
+static std::optional<u32> TryPickFirstResolvableEdge(IR::Value value) {
+    const IR::Inst* inst = value.TryInst();
+    if (inst == nullptr || inst->GetOpcode() != IR::Opcode::Phi) {
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < inst->NumArgs(); i++) {
+        if (const auto v = TryEvaluateConstU32(inst->Arg(i))) {
+            return v;
+        }
+    }
+    return std::nullopt;
 }
 
 static void DumpIRValue(std::string& out, IR::Value value, u32 depth) {
@@ -446,6 +474,7 @@ static IR::F32 ReadTessControlPointAttribute(IR::U32 addr, const u32 stride, IR:
 
 void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) {
     const Info& info = program.info;
+    bool dumped_program = false;
 
     for (IR::Block* block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
@@ -468,7 +497,7 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                 // The element index selects a record of the bound descriptor's stride, which this
                 // pass cannot reconstruct, so only descriptor-relative addressing is supported.
                 const auto index_value = TryEvaluateConstU32(IR::GetBufferIndexArg(&inst));
-                const auto voffset_value = TryEvaluateConstU32(IR::GetBufferVOffsetArg(&inst));
+                auto voffset_value = TryEvaluateConstU32(IR::GetBufferVOffsetArg(&inst));
                 if (!index_value || *index_value != 0 || !voffset_value) {
                     std::string shape;
                     DumpIRValue(shape, inst.Arg(IR::StoreBufferArgs::Address), 0);
@@ -478,6 +507,20 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                               static_cast<u32>(runtime_info.sw.tcs.tess_type),
                               static_cast<bool>(info.index_enable),
                               static_cast<bool>(info.voffset_enable), shape);
+                    if (!dumped_program) {
+                        IR::DumpProgram(program, program.info, "hull-unresolved");
+                        dumped_program = true;
+                    }
+                }
+                if (!voffset_value) {
+                    voffset_value = TryPickFirstResolvableEdge(IR::GetBufferVOffsetArg(&inst));
+                    if (voffset_value) {
+                        LOG_WARNING(Render_Recompiler,
+                                    "Approximating runtime tessellation factor selection with "
+                                    "offset {} (tess_type={})",
+                                    *voffset_value,
+                                    static_cast<u32>(runtime_info.sw.tcs.tess_type));
+                    }
                 }
                 ASSERT_MSG(index_value && *index_value == 0 && voffset_value,
                            "unhandled pattern in tess factor store");
