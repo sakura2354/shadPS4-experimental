@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
@@ -346,6 +349,80 @@ static IR::U32 TryOptimizeAddressModulo(IR::U32 addr, u32 stride, IR::IREmitter&
 
 // TODO: can optimize div in control point index similarly to mod
 
+// Constant propagation is not guaranteed to have folded every address computation by the time
+// this pass runs, so resolve simple constant expressions instead of requiring a single immediate.
+static std::optional<u32> TryEvaluateConstU32(IR::Value value, u32 depth = 0) {
+    if (depth > 8) {
+        return std::nullopt;
+    }
+    const IR::Inst* inst = value.TryInst();
+    if (inst == nullptr) {
+        return value.Type() == IR::Type::U32 ? std::optional<u32>{value.U32()} : std::nullopt;
+    }
+    const auto eval = [depth](IR::Value arg) { return TryEvaluateConstU32(arg, depth + 1); };
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::IAdd32: {
+        const auto a = eval(inst->Arg(0));
+        const auto b = eval(inst->Arg(1));
+        if (a && b) {
+            return *a + *b;
+        }
+        return std::nullopt;
+    }
+    case IR::Opcode::IMul32: {
+        const auto a = eval(inst->Arg(0));
+        const auto b = eval(inst->Arg(1));
+        if (a && b) {
+            return *a * *b;
+        }
+        return std::nullopt;
+    }
+    case IR::Opcode::ShiftLeftLogical32: {
+        const auto a = eval(inst->Arg(0));
+        const auto b = eval(inst->Arg(1));
+        if (a && b && *b < 32) {
+            return *a << *b;
+        }
+        return std::nullopt;
+    }
+    case IR::Opcode::BitFieldUExtract: {
+        const auto a = eval(inst->Arg(0));
+        const auto offset = eval(inst->Arg(1));
+        const auto count = eval(inst->Arg(2));
+        if (a && offset && count && *count > 0 && *count < 32) {
+            return (*a >> *offset) & ((1u << *count) - 1u);
+        }
+        return std::nullopt;
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+static void DumpIRValue(std::string& out, IR::Value value, u32 depth) {
+    if (depth > 6) {
+        out += "...";
+        return;
+    }
+    const IR::Inst* inst = value.TryInst();
+    if (inst == nullptr) {
+        if (value.Type() == IR::Type::U32) {
+            out += fmt::format("0x{:x}", value.U32());
+        } else {
+            out += "<imm>";
+        }
+        return;
+    }
+    out += fmt::format("{}(", IR::NameOf(inst->GetOpcode()));
+    for (size_t i = 0; i < inst->NumArgs(); i++) {
+        if (i != 0) {
+            out += ", ";
+        }
+        DumpIRValue(out, inst->Arg(i), depth + 1);
+    }
+    out += ")";
+}
+
 // Read a TCS input (InputCP region) or TES input (OutputCP region)
 static IR::F32 ReadTessControlPointAttribute(IR::U32 addr, const u32 stride, IR::IREmitter& ir,
                                              u32 off_dw, bool is_output_read_in_tcs) {
@@ -388,13 +465,24 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                 const auto info = inst.Flags<IR::BufferInstInfo>();
                 IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
 
-                IR::Value voffset;
-                bool success =
-                    M_COMPOSITECONSTRUCTU32X3(MatchU32(0), MatchImm(voffset), MatchIgnore())
-                        .Match(inst.Arg(IR::StoreBufferArgs::Address));
-                ASSERT_MSG(success, "unhandled pattern in tess factor store");
+                // The element index selects a record of the bound descriptor's stride, which this
+                // pass cannot reconstruct, so only descriptor-relative addressing is supported.
+                const auto index_value = TryEvaluateConstU32(IR::GetBufferIndexArg(&inst));
+                const auto voffset_value = TryEvaluateConstU32(IR::GetBufferVOffsetArg(&inst));
+                if (!index_value || *index_value != 0 || !voffset_value) {
+                    std::string shape;
+                    DumpIRValue(shape, inst.Arg(IR::StoreBufferArgs::Address), 0);
+                    LOG_ERROR(Render_Recompiler,
+                              "Tessellation factor store with unresolvable address "
+                              "(tess_type={}, idxen={}, offen={}): {}",
+                              static_cast<u32>(runtime_info.sw.tcs.tess_type),
+                              static_cast<bool>(info.index_enable),
+                              static_cast<bool>(info.voffset_enable), shape);
+                }
+                ASSERT_MSG(index_value && *index_value == 0 && voffset_value,
+                           "unhandled pattern in tess factor store");
 
-                const u32 gcn_factor_idx = (info.inst_offset.Value() + voffset.U32()) >> 2;
+                const u32 gcn_factor_idx = (info.inst_offset.Value() + *voffset_value) >> 2;
                 const IR::Value data = inst.Arg(IR::StoreBufferArgs::Data);
 
                 const u32 num_dwords = u32(opcode) - u32(IR::Opcode::StoreBufferU32) + 1;
@@ -701,10 +789,15 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
                         // See the explanation for why we set V2 to 0 when emitting the prologue.
                         inst.ReplaceUsesWithAndRemove(IR::Value(0u));
                         break;
+                    case Shader::TessConstantAttribute::FirstEdgeTessFactorIndex:
+                        // Tessellation factors are emitted as relative indices into the
+                        // TessLevelOuter/TessLevelInner builtins, so the driver's placement of the
+                        // factor block within its buffer must not contribute to the index.
+                        inst.ReplaceUsesWithAndRemove(IR::Value(0u));
+                        break;
                     case Shader::TessConstantAttribute::PatchConstSize:
                     case Shader::TessConstantAttribute::PatchOutputSize:
                     case Shader::TessConstantAttribute::OffChipTessellationFactorThreshold:
-                    case Shader::TessConstantAttribute::FirstEdgeTessFactorIndex:
                         // May need to replace PatchConstSize and PatchOutputSize with 0
                         break;
                     default:
