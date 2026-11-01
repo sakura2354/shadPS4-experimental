@@ -348,7 +348,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
-        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        LOG_INFO(Render_Vulkan,
+                 "Compiling graphics pipeline {:#x} prim={} patch_cp={} stages={:#x}",
+                 pipeline_hash, static_cast<u32>(graphics_key.prim_type),
+                 graphics_key.patch_control_points, liverpool->regs.stage_enable.raw);
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
