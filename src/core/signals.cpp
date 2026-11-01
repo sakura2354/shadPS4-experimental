@@ -33,9 +33,7 @@ namespace Core {
 // Resolve a guest address to the module that owns it, so crash reports show module + offset
 // instead of an opaque absolute address.
 static void LogGuestAddressOwner(VAddr addr) {
-    using namespace Libraries::Kernel;
-    auto* emulator = Common::Singleton<Core::Emulator>::Instance();
-    auto* linker = emulator->GetLinker();
+    auto* linker = Common::Singleton<Core::Emulator>::Instance()->GetLinker();
     if (linker == nullptr) {
         LOG_CRITICAL(Debug, "  {:#x} not attributable: linker unavailable", addr);
         return;
@@ -46,7 +44,7 @@ static void LogGuestAddressOwner(VAddr addr) {
             continue;
         }
         const auto info = module->GetModuleInfoEx();
-        for (u32 seg = 0; seg < info.segment_count; seg++) {
+        for (u32 seg = 0; seg < info.segment_count && seg < info.segments.size(); seg++) {
             const auto& segment = info.segments[seg];
             if (addr >= segment.address && addr < segment.address + segment.size) {
                 LOG_CRITICAL(Debug, "  {:#x} inside {} + {:#x} (segment {}, prot={:#x})", addr,
@@ -58,7 +56,7 @@ static void LogGuestAddressOwner(VAddr addr) {
     LOG_CRITICAL(Debug, "  {:#x} not inside any loaded module", addr);
 }
 
-static void LogCrashRegisters(const Ucontext& guest_context) {
+static void LogCrashRegisters(const Libraries::Kernel::Ucontext& guest_context) {
     const auto& mc = guest_context.uc_mcontext;
     LOG_CRITICAL(Debug, "  rip={:#x} rsp={:#x} rbp={:#x}", mc.mc_rip, mc.mc_rsp, mc.mc_rbp);
     LOG_CRITICAL(Debug, "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}", mc.mc_rax, mc.mc_rbx,
@@ -91,9 +89,7 @@ static bool TryReadStackSlot(VAddr slot, VAddr& out) {
 // Walk the guest stack looking for values that fall inside a loaded module. This is a heuristic
 // backtrace: it may list stale frames, but it is enough to identify the failing call path.
 static void LogGuestStackScan(VAddr rsp) {
-    using namespace Libraries::Kernel;
-    auto* emulator = Common::Singleton<Core::Emulator>::Instance();
-    auto* linker = emulator->GetLinker();
+    auto* linker = Common::Singleton<Core::Emulator>::Instance()->GetLinker();
     if (linker == nullptr || rsp == 0) {
         return;
     }
@@ -114,7 +110,7 @@ static void LogGuestStackScan(VAddr rsp) {
                 continue;
             }
             const auto info = module->GetModuleInfoEx();
-            for (u32 seg = 0; seg < info.segment_count; seg++) {
+            for (u32 seg = 0; seg < info.segment_count && seg < info.segments.size(); seg++) {
                 const auto& segment = info.segments[seg];
                 if (candidate >= segment.address && candidate < segment.address + segment.size) {
                     LOG_CRITICAL(Debug, "  [stack+{:#x}] {} + {:#x}", frame * FrameBytes,
