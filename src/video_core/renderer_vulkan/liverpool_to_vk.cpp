@@ -87,7 +87,6 @@ bool IsPrimitiveCulled(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::PatchPrimitive:
     case AmdGpu::PrimitiveType::AdjTriangleList:
     case AmdGpu::PrimitiveType::AdjTriangleStrip:
-    case AmdGpu::PrimitiveType::QuadList:
     case AmdGpu::PrimitiveType::QuadStrip:
     case AmdGpu::PrimitiveType::Polygon:
         return true;
@@ -97,7 +96,11 @@ bool IsPrimitiveCulled(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::LineStrip:
     case AmdGpu::PrimitiveType::AdjLineList:
     case AmdGpu::PrimitiveType::AdjLineStrip:
-    case AmdGpu::PrimitiveType::RectList: // Screen-aligned rectangles that are not culled
+    // Rect and quad lists are expanded by an auxiliary tessellation shader whose evaluation stage
+    // fixes the vertex order, so the winding no longer follows the primitive the guest described
+    // and culling based on the polygon control registers would discard visible geometry.
+    case AmdGpu::PrimitiveType::RectList:
+    case AmdGpu::PrimitiveType::QuadList:
     case AmdGpu::PrimitiveType::LineLoop:
         return false;
     default:
