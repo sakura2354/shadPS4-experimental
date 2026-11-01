@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
@@ -27,6 +29,101 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 namespace Core {
 
 #if defined(_WIN32)
+
+// Resolve a guest address to the module that owns it, so crash reports show module + offset
+// instead of an opaque absolute address.
+static void LogGuestAddressOwner(VAddr addr) {
+    using namespace Libraries::Kernel;
+    auto* emulator = Common::Singleton<Core::Emulator>::Instance();
+    auto* linker = emulator->GetLinker();
+    if (linker == nullptr) {
+        LOG_CRITICAL(Debug, "  {:#x} not attributable: linker unavailable", addr);
+        return;
+    }
+    for (u32 i = 0; i < linker->GetModuleCount(); i++) {
+        const auto* module = linker->GetModule(static_cast<s32>(i));
+        if (module == nullptr) {
+            continue;
+        }
+        const auto info = module->GetModuleInfoEx();
+        for (u32 seg = 0; seg < info.segment_count; seg++) {
+            const auto& segment = info.segments[seg];
+            if (addr >= segment.address && addr < segment.address + segment.size) {
+                LOG_CRITICAL(Debug, "  {:#x} inside {} + {:#x} (segment {}, prot={:#x})", addr,
+                             module->name, addr - module->GetBaseAddress(), seg, segment.prot);
+                return;
+            }
+        }
+    }
+    LOG_CRITICAL(Debug, "  {:#x} not inside any loaded module", addr);
+}
+
+static void LogCrashRegisters(const Ucontext& guest_context) {
+    const auto& mc = guest_context.uc_mcontext;
+    LOG_CRITICAL(Debug, "  rip={:#x} rsp={:#x} rbp={:#x}", mc.mc_rip, mc.mc_rsp, mc.mc_rbp);
+    LOG_CRITICAL(Debug, "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}", mc.mc_rax, mc.mc_rbx,
+                 mc.mc_rcx, mc.mc_rdx);
+    LOG_CRITICAL(Debug, "  rdi={:#x} rsi={:#x} r8={:#x} r9={:#x}", mc.mc_rdi, mc.mc_rsi,
+                 mc.mc_r8, mc.mc_r9);
+    LOG_CRITICAL(Debug, "  r10={:#x} r11={:#x} r12={:#x} r13={:#x}", mc.mc_r10, mc.mc_r11,
+                 mc.mc_r12, mc.mc_r13);
+    LOG_CRITICAL(Debug, "  r14={:#x} r15={:#x} rflags={:#x}", mc.mc_r14, mc.mc_r15,
+                 mc.mc_rflags);
+}
+
+// Reading guest memory while unwinding a crash can itself fault, so only touch slots that the host
+// memory manager confirms as committed and readable.
+static bool TryReadStackSlot(VAddr slot, VAddr& out) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(slot), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+        return false;
+    }
+    std::memcpy(&out, reinterpret_cast<const void*>(slot), sizeof(out));
+    return true;
+}
+
+// Walk the guest stack looking for values that fall inside a loaded module. This is a heuristic
+// backtrace: it may list stale frames, but it is enough to identify the failing call path.
+static void LogGuestStackScan(VAddr rsp) {
+    using namespace Libraries::Kernel;
+    auto* emulator = Common::Singleton<Core::Emulator>::Instance();
+    auto* linker = emulator->GetLinker();
+    if (linker == nullptr || rsp == 0) {
+        return;
+    }
+    constexpr u32 MaxFrames = 32;
+    constexpr u32 FrameBytes = 8;
+    for (u32 frame = 0; frame < MaxFrames; frame++) {
+        const VAddr slot = rsp + frame * FrameBytes;
+        if (slot == 0) {
+            break;
+        }
+        VAddr candidate{};
+        if (!TryReadStackSlot(slot, candidate) || candidate == 0) {
+            continue;
+        }
+        for (u32 i = 0; i < linker->GetModuleCount(); i++) {
+            const auto* module = linker->GetModule(static_cast<s32>(i));
+            if (module == nullptr) {
+                continue;
+            }
+            const auto info = module->GetModuleInfoEx();
+            for (u32 seg = 0; seg < info.segment_count; seg++) {
+                const auto& segment = info.segments[seg];
+                if (candidate >= segment.address && candidate < segment.address + segment.size) {
+                    LOG_CRITICAL(Debug, "  [stack+{:#x}] {} + {:#x}", frame * FrameBytes,
+                                 module->name, candidate - module->GetBaseAddress());
+                }
+            }
+        }
+    }
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -143,6 +240,21 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        if (g_curthread != nullptr && !g_curthread->name.empty()) {
+            LOG_CRITICAL(Debug, "  thread '{}' tid={}", g_curthread->name, g_curthread->tid.load());
+        } else {
+            LOG_CRITICAL(Debug, "  thread <unnamed> (g_curthread={})",
+                         g_curthread != nullptr ? "present" : "null");
+        }
+        LogCrashRegisters(guest_context);
+        LogGuestAddressOwner(guest_context.uc_mcontext.mc_rip);
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            const auto access = pExp->ExceptionRecord->ExceptionInformation[1];
+            LOG_CRITICAL(Debug, "  faulting address={:#x} ({})", access,
+                         pExp->ExceptionRecord->ExceptionInformation[0] == 0 ? "read" : "write");
+            LogGuestAddressOwner(access);
+        }
+        LogGuestStackScan(guest_context.uc_mcontext.mc_rsp);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
