@@ -61,12 +61,11 @@ static void LogCrashRegisters(const Libraries::Kernel::Ucontext& guest_context) 
     LOG_CRITICAL(Debug, "  rip={:#x} rsp={:#x} rbp={:#x}", mc.mc_rip, mc.mc_rsp, mc.mc_rbp);
     LOG_CRITICAL(Debug, "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}", mc.mc_rax, mc.mc_rbx,
                  mc.mc_rcx, mc.mc_rdx);
-    LOG_CRITICAL(Debug, "  rdi={:#x} rsi={:#x} r8={:#x} r9={:#x}", mc.mc_rdi, mc.mc_rsi,
-                 mc.mc_r8, mc.mc_r9);
+    LOG_CRITICAL(Debug, "  rdi={:#x} rsi={:#x} r8={:#x} r9={:#x}", mc.mc_rdi, mc.mc_rsi, mc.mc_r8,
+                 mc.mc_r9);
     LOG_CRITICAL(Debug, "  r10={:#x} r11={:#x} r12={:#x} r13={:#x}", mc.mc_r10, mc.mc_r11,
                  mc.mc_r12, mc.mc_r13);
-    LOG_CRITICAL(Debug, "  r14={:#x} r15={:#x} rflags={:#x}", mc.mc_r14, mc.mc_r15,
-                 mc.mc_rflags);
+    LOG_CRITICAL(Debug, "  r14={:#x} r15={:#x} rflags={:#x}", mc.mc_r14, mc.mc_r15, mc.mc_rflags);
 }
 
 // Reading guest memory while unwinding a crash can itself fault, so only touch slots that the host
