@@ -45,6 +45,10 @@ public:
      */
     [[noreturn]] void Relaunch(std::vector<std::string> args);
 
+    Core::Linker* GetLinker() const {
+        return linker;
+    }
+
     const char* executableName;
     bool waitForDebuggerBeforeRun{false};
 
