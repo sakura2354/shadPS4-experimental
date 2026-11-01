@@ -88,6 +88,10 @@ public:
         return nullptr;
     }
 
+    u32 GetModuleCount() const {
+        return static_cast<u32>(m_modules.size());
+    }
+
     u32 FindByName(const std::filesystem::path& name) const {
         for (u32 i = 0; i < m_modules.size(); i++) {
             if (name == m_modules[i]->file) {
