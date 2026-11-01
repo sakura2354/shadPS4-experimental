@@ -676,7 +676,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     SmallVector<ImageId, 4> image_ids;
+    size_t candidates{};
     ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
+        candidates++;
         if (ensure_valid && !image.HasGpuValidData()) {
             return;
         }
@@ -698,8 +700,23 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
             }
         }
         LOG_WARNING(Render_Vulkan,
-                    "Failed to find exact image match for copy addr={:#x}, size={:#x}", address,
-                    size);
+                    "Failed to find exact image match for copy addr={:#x}, size={:#x}, "
+                    "candidates={}, usable={}",
+                    address, size, candidates, image_ids.size());
+        ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
+            LOG_WARNING(Render_Vulkan,
+                        "  candidate image {:#x} guest_size={:#x} gpu_modified={} dirty={} "
+                        "samples={} levels={}",
+                        image.info.guest_address, image.info.guest_size,
+                        True(image.flags & ImageFlagBits::GpuModified),
+                        True(image.flags & ImageFlagBits::Dirty), image.info.num_samples,
+                        image.info.resources.levels);
+        });
+    } else if (candidates != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "No image with GPU valid data for copy addr={:#x}, size={:#x}, "
+                    "candidates={} (all filtered by ensure_valid)",
+                    address, size, candidates);
     }
     return {};
 }
