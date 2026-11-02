@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <vector>
+#include <array>
 
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -278,28 +278,6 @@ void Rasterizer::LogSampledImageState(const GraphicsPipeline* pipeline) {
     const bool is_dirty = (image.flags & VideoCore::ImageFlagBits::Dirty) != 0;
     const bool is_untracked = image.track_addr == 0 || image.track_addr_end == 0;
 
-    // Read the guest bytes behind the descriptor. A texel of R8_UNORM carries one byte, so counting
-    // the non-zero bytes of the first row tells an atlas that was never filled from one that only
-    // renders wrong: an all-zero row means the shader samples fully transparent black.
-    u32 non_zero = 0;
-    u32 sampled = 0;
-    u32 peak = 0;
-    // width, height and pitch are 14-bit fields of the T# register, so narrow them on the way in.
-    const u32 pitch = static_cast<u32>(tsharp.pitch);
-    const u32 width = static_cast<u32>(tsharp.width);
-    const u32 row_bytes = pitch != 0 ? pitch : width;
-    if (row_bytes != 0 && memory->IsValidGpuMapping(tsharp.Address(), row_bytes)) {
-        std::vector<u8> row(row_bytes);
-        memory->CopySparseMemory(tsharp.Address(), row.data(), row_bytes);
-        for (const u8 value : row) {
-            if (value != 0) {
-                ++non_zero;
-                peak = std::max(peak, static_cast<u32>(value));
-            }
-        }
-        sampled = row_bytes;
-    }
-
     LOG_INFO(Render_Vulkan,
              "SS-list img addr={:#x} fmt={} type={} tiled={} size={}x{}x{} mips={} pitch={} "
              "gpu_valid={} dirty={} untracked={} guest_size={:#x}",
@@ -307,7 +285,28 @@ void Rasterizer::LogSampledImageState(const GraphicsPipeline* pipeline) {
              info.IsTiled(), info.size.width, info.size.height, info.size.depth,
              info.resources.levels, info.pitch, image.HasGpuValidData(), is_dirty, is_untracked,
              info.guest_size);
-    LOG_INFO(Render_Vulkan, "SS-list img row sampled={} non_zero={} peak={}", sampled, non_zero,
+
+    // A texel of R8_UNORM is one byte, so the first row of guest bytes says whether the atlas was
+    // ever filled: an all-zero row samples as transparent black and looks exactly like a dropped
+    // draw. Sample a fixed window instead of a whole row to keep this cheap and allocation free.
+    constexpr u32 SampleBytes = 256;
+    std::array<u8, SampleBytes> window{};
+    u32 non_zero = 0;
+    u32 peak = 0;
+    const u32 pitch = static_cast<u32>(tsharp.pitch);
+    const u32 width = static_cast<u32>(tsharp.width);
+    const u32 window_bytes = std::min(pitch != 0 ? pitch : width, SampleBytes);
+    if (window_bytes != 0 && memory->IsValidGpuMapping(tsharp.Address(), window_bytes)) {
+        memory->CopySparseMemory(tsharp.Address(), window.data(), window_bytes);
+        for (u32 i = 0; i < window_bytes; i++) {
+            const u32 value = static_cast<u32>(window[i]);
+            if (value != 0) {
+                ++non_zero;
+                peak = std::max(peak, value);
+            }
+        }
+    }
+    LOG_INFO(Render_Vulkan, "SS-list img window={} non_zero={} peak={}", window_bytes, non_zero,
              peak);
 }
 
