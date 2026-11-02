@@ -184,6 +184,64 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+// Screen-space lists are expanded by an auxiliary tessellation shader, so a draw that ends up
+// producing nothing usually hides the reason in render state instead of in the draw call itself.
+// Log the target surface and the rasterizer state of the first few of them. Both entry points are
+// covered on purpose: the game routes many of these draws through the indirect path, and a log
+// that only covered the direct one would look exactly like a draw that never happened at all.
+static void LogScreenSpaceDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
+                               bool is_indexed, bool is_indirect, u32 count) {
+    const auto& key = pipeline->GetGraphicsKey();
+    if (key.prim_type != AmdGpu::PrimitiveType::RectList &&
+        key.prim_type != AmdGpu::PrimitiveType::QuadList) {
+        return;
+    }
+    static u32 logged_direct = 0;
+    static u32 logged_indirect = 0;
+    u32& logged = is_indirect ? logged_indirect : logged_direct;
+    if (logged >= 16) {
+        return;
+    }
+    ++logged;
+
+    const auto scissor = regs.GetCombinedScissor();
+    const auto& cb0 = regs.color_buffers[0];
+    const auto& vp = regs.viewports[0];
+    const auto& bc = regs.blend_control[0];
+
+    LOG_INFO(Render_Vulkan,
+             "SS-list draw prim={} indirect={} idx={} count={} inst={} scissor={},{}-{},{}",
+             static_cast<u32>(key.prim_type), is_indirect, is_indexed, count,
+             regs.num_instances.NumInstances(), static_cast<s32>(scissor.top_left_x),
+             static_cast<s32>(scissor.top_left_y), static_cast<s32>(scissor.bottom_right_x),
+             static_cast<s32>(scissor.bottom_right_y));
+    LOG_INFO(Render_Vulkan, "SS-list target cb0={:#x} fmt={}/{} tile={} vp={:.1f},{:.1f}",
+             cb0.Address(), static_cast<u32>(cb0.GetDataFmt()),
+             static_cast<u32>(cb0.GetNumberFmt()), static_cast<u32>(cb0.GetTileMode()), vp.xscale,
+             vp.yscale);
+    LOG_INFO(Render_Vulkan, "SS-list raster depth_en={} depth_fn={} blend={} mrts={}",
+             regs.depth_control.depth_enable, static_cast<u32>(regs.depth_control.depth_func),
+             bc.enable, static_cast<u32>(key.mrt_mask));
+
+    // A screen-space list that is drawn with sane raster state but never shows up almost always
+    // loses its fragments to a texture that was bound with no usable data behind it, so report the
+    // image descriptors the fragment stage will actually sample.
+    const auto& fs = pipeline->GetStage(Shader::SwStage::Fragment);
+    LOG_INFO(Render_Vulkan, "SS-list fs textures={} buffers={}", fs.images.size(),
+             fs.buffers.size());
+    u32 tex_index = 0;
+    for (const auto& image_desc : fs.images) {
+        const auto tsharp = image_desc.GetSharp(fs);
+        LOG_INFO(Render_Vulkan, "SS-list tex[{}] addr={:#x} fmt={}/{} size={}x{}",
+                 tex_index, tsharp.Address(), static_cast<u32>(tsharp.GetDataFmt()),
+                 static_cast<u32>(tsharp.GetNumberFmt()), static_cast<u32>(tsharp.width),
+                 static_cast<u32>(tsharp.height));
+        if (++tex_index >= 4) {
+            break;
+        }
+    }
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -200,29 +258,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    // Screen-space lists are expanded by an auxiliary tessellation shader. When they fail to
-    // appear the usual causes are the scissor, the depth test or blending, none of which a draw
-    // call alone can show, so log the state of the first few of them.
-    if (const auto& key = pipeline->GetGraphicsKey();
-        key.prim_type == AmdGpu::PrimitiveType::RectList ||
-        key.prim_type == AmdGpu::PrimitiveType::QuadList) {
-        static u32 logged_rect_draws = 0;
-        if (logged_rect_draws < 24) {
-            const auto scissor = regs.GetCombinedScissor();
-            const auto& bc = regs.blend_control[0];
-            LOG_INFO(Render_Vulkan,
-                     "SS-list draw prim={} idx={} count={} inst={} off={:#x} "
-                     "scissor={},{}-{},{} cb={} depth_en={} depth_fn={} blend={} mrts={}",
-                     static_cast<u32>(key.prim_type), is_indexed, regs.num_indices,
-                     regs.num_instances.NumInstances(), regs.index_offset,
-                     static_cast<s32>(scissor.top_left_x), static_cast<s32>(scissor.top_left_y),
-                     static_cast<s32>(scissor.bottom_right_x),
-                     static_cast<s32>(scissor.bottom_right_y),
-                     static_cast<u32>(regs.color_control.mode), regs.depth_control.depth_enable,
-                     static_cast<u32>(regs.depth_control.depth_func), bc.enable, key.mrt_mask);
-            logged_rect_draws++;
-        }
-    }
+    LogScreenSpaceDraw(regs, pipeline, is_indexed, false, regs.num_indices);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -283,6 +319,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
+
+    LogScreenSpaceDraw(liverpool->regs, pipeline, is_indexed, true, max_count);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
