@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <vulkan/vulkan_format_traits.hpp>
-
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -21,6 +19,8 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
 
@@ -268,9 +268,16 @@ void Rasterizer::LogSampledImageState(const GraphicsPipeline* pipeline) {
     ++logged_state;
 
     const auto tsharp = fs.images[0].GetSharp(fs);
-    LOG_INFO(Render_Vulkan, "SS-list img addr={:#x} pitch={} width={} height={} fmt={}",
-             tsharp.Address(), static_cast<u32>(tsharp.pitch), static_cast<u32>(tsharp.width),
-             static_cast<u32>(tsharp.height), static_cast<u32>(tsharp.GetDataFmt()));
+    const u32 dhw = static_cast<u32>(tsharp.width) + 1;
+    const u32 dhh = static_cast<u32>(tsharp.height) + 1;
+    LOG_INFO(Render_Vulkan,
+             "SS-list img addr={:#x} fmt={}/{} type={} dhw={}x{} pitch={} levels={} samples={} "
+             "tiled={} sel={}/{}/{}/{}",
+             tsharp.Address(), static_cast<u32>(tsharp.GetDataFmt()),
+             static_cast<u32>(tsharp.GetNumberFmt()), static_cast<u32>(tsharp.GetType()), dhw,
+             dhh, tsharp.Pitch(), tsharp.NumLevels(), tsharp.NumSamples(), tsharp.IsTiled(),
+             static_cast<u32>(tsharp.dst_sel_x), static_cast<u32>(tsharp.dst_sel_y),
+             static_cast<u32>(tsharp.dst_sel_z), static_cast<u32>(tsharp.dst_sel_w));
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
