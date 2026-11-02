@@ -259,7 +259,7 @@ static void LogHudLikeDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pip
 // The draws above can be in perfect order and still land on nothing: the atlas they sample is an
 // ordinary guest image that has to be created and filled before it holds any glyph. Report what the
 // texture cache actually holds for the sampled address so an empty atlas is visible in the log.
-void Rasterizer::LogSampledImageState(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline) {
+void Rasterizer::LogSampledImageState(const GraphicsPipeline* pipeline) {
     const auto& fs = pipeline->GetStage(Shader::SwStage::Fragment);
     if (fs.images.empty()) {
         return;
@@ -283,15 +283,18 @@ void Rasterizer::LogSampledImageState(const AmdGpu::Regs& regs, const GraphicsPi
     // renders wrong: an all-zero row means the shader samples fully transparent black.
     u32 non_zero = 0;
     u32 sampled = 0;
-    u8 peak = 0;
-    const u32 row_bytes = tsharp.pitch != 0 ? tsharp.pitch : tsharp.width;
-    if (memory->IsValidGpuMapping(tsharp.Address(), row_bytes)) {
+    u32 peak = 0;
+    // width, height and pitch are 14-bit fields of the T# register, so narrow them on the way in.
+    const u32 pitch = static_cast<u32>(tsharp.pitch);
+    const u32 width = static_cast<u32>(tsharp.width);
+    const u32 row_bytes = pitch != 0 ? pitch : width;
+    if (row_bytes != 0 && memory->IsValidGpuMapping(tsharp.Address(), row_bytes)) {
         std::vector<u8> row(row_bytes);
         memory->CopySparseMemory(tsharp.Address(), row.data(), row_bytes);
         for (const u8 value : row) {
             if (value != 0) {
                 ++non_zero;
-                peak = std::max(peak, value);
+                peak = std::max(peak, static_cast<u32>(value));
             }
         }
         sampled = row_bytes;
@@ -326,7 +329,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     LogHudLikeDraw(regs, pipeline, is_indexed, false, regs.num_indices);
     if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
-        LogSampledImageState(regs, pipeline);
+        LogSampledImageState(pipeline);
     }
 
     PrepareRenderState(pipeline);

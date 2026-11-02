@@ -118,7 +118,7 @@ private:
 
     bool FilterDraw();
 
-    void LogSampledImageState(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline);
+    void LogSampledImageState(const GraphicsPipeline* pipeline);
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
