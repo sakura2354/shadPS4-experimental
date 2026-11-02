@@ -20,6 +20,9 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <algorithm>
+#include <vector>
+
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
@@ -253,6 +256,58 @@ static void LogHudLikeDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pip
     }
 }
 
+// The draws above can be in perfect order and still land on nothing: the atlas they sample is an
+// ordinary guest image that has to be created and filled before it holds any glyph. Report what the
+// texture cache actually holds for the sampled address so an empty atlas is visible in the log.
+void Rasterizer::LogSampledImageState(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline) {
+    const auto& fs = pipeline->GetStage(Shader::SwStage::Fragment);
+    if (fs.images.empty()) {
+        return;
+    }
+    static u32 logged_state = 0;
+    if (logged_state >= 6) {
+        return;
+    }
+    ++logged_state;
+
+    const auto tsharp = fs.images[0].GetSharp(fs);
+    VideoCore::TextureCache::ImageDesc desc(tsharp, fs.images[0]);
+    const auto image_id = texture_cache.FindImage(desc);
+    const auto& image = texture_cache.GetImage(image_id);
+    const auto& info = image.info;
+    const bool is_dirty = (image.flags & VideoCore::ImageFlagBits::Dirty) != 0;
+    const bool is_untracked = image.track_addr == 0 || image.track_addr_end == 0;
+
+    // Read the guest bytes behind the descriptor. A texel of R8_UNORM carries one byte, so counting
+    // the non-zero bytes of the first row tells an atlas that was never filled from one that only
+    // renders wrong: an all-zero row means the shader samples fully transparent black.
+    u32 non_zero = 0;
+    u32 sampled = 0;
+    u8 peak = 0;
+    const u32 row_bytes = tsharp.pitch != 0 ? tsharp.pitch : tsharp.width;
+    if (memory->IsValidGpuMapping(tsharp.Address(), row_bytes)) {
+        std::vector<u8> row(row_bytes);
+        memory->CopySparseMemory(tsharp.Address(), row.data(), row_bytes);
+        for (const u8 value : row) {
+            if (value != 0) {
+                ++non_zero;
+                peak = std::max(peak, value);
+            }
+        }
+        sampled = row_bytes;
+    }
+
+    LOG_INFO(Render_Vulkan,
+             "SS-list img addr={:#x} fmt={} type={} tiled={} size={}x{}x{} mips={} pitch={} "
+             "gpu_valid={} dirty={} untracked={} guest_size={:#x}",
+             tsharp.Address(), static_cast<u32>(info.pixel_format), static_cast<u32>(info.type),
+             info.IsTiled(), info.size.width, info.size.height, info.size.depth,
+             info.resources.levels, info.pitch, image.HasGpuValidData(), is_dirty, is_untracked,
+             info.guest_size);
+    LOG_INFO(Render_Vulkan, "SS-list img row sampled={} non_zero={} peak={}", sampled, non_zero,
+             peak);
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -270,6 +325,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     LogHudLikeDraw(regs, pipeline, is_indexed, false, regs.num_indices);
+    if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+        LogSampledImageState(regs, pipeline);
+    }
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
