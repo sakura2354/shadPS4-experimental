@@ -351,7 +351,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan,
                  "Compiling graphics pipeline {:#x} prim={} patch_cp={} stages={:#x}",
                  pipeline_hash, static_cast<u32>(graphics_key.prim_type),
-                 graphics_key.patch_control_points, liverpool->regs.stage_enable.raw);
+                 graphics_key.patch_control_points,
+                 static_cast<u32>(liverpool->regs.stage_enable.raw));
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
