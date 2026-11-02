@@ -1032,6 +1032,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image_id = depth_image_id;
                 image = &texture_cache.GetImage(image_id);
             }
+            // FindImage only locates or creates the backing image; it does not pull guest contents
+            // into it. A texture that the guest filled from the CPU and that is sampled before it
+            // is ever used as a render target therefore reaches the shader as all zeroes, which is
+            // how the HUD glyph atlas sampled as fully transparent. Refresh it so the upload is
+            // recorded before the descriptor is written. Storage images are written by the shader
+            // and must not be refreshed from stale guest memory.
+            if (!image_desc.is_written) {
+                texture_cache.UpdateImage(image_id);
+                image = &texture_cache.GetImage(image_id);
+            }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
                 // need to force general layout on it.
