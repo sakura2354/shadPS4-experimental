@@ -184,51 +184,62 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
-// Screen-space lists are expanded by an auxiliary tessellation shader, so a draw that ends up
-// producing nothing usually hides the reason in render state instead of in the draw call itself.
-// Log the target surface and the rasterizer state of the first few of them. Both entry points are
-// covered on purpose: the game routes many of these draws through the indirect path, and a log
-// that only covered the direct one would look exactly like a draw that never happened at all.
-static void LogScreenSpaceDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
-                               bool is_indexed, bool is_indirect, u32 count) {
+// A draw that ends up producing nothing on screen hides the reason in render state or in the
+// textures it samples, neither of which a draw call alone can show. Two shapes matter here:
+// screen-space lists, which are expanded by an auxiliary tessellation shader, and the blended,
+// depth-less textured quads the HUD is made of. Their budgets are kept separate on purpose: an
+// untextured clear must not be able to exhaust the counter and hide the textured draws behind it.
+static void LogHudLikeDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
+                           bool is_indexed, bool is_indirect, u32 count) {
     const auto& key = pipeline->GetGraphicsKey();
-    if (key.prim_type != AmdGpu::PrimitiveType::RectList &&
-        key.prim_type != AmdGpu::PrimitiveType::QuadList) {
+    const auto& fs = pipeline->GetStage(Shader::SwStage::Fragment);
+    const u32 num_textures = static_cast<u32>(fs.images.size());
+    const bool is_ui_draw = !regs.depth_control.depth_enable && num_textures != 0;
+
+    // Give each shape its own budget. A shared counter lets one kind of draw consume every slot,
+    // which is exactly what happened while the rect list fills were still the only thing sampled.
+    static u32 logged_rect = 0;
+    static u32 logged_quad = 0;
+    static u32 logged_ui = 0;
+    u32* logged = nullptr;
+    u32 limit = 0;
+    switch (key.prim_type) {
+    case AmdGpu::PrimitiveType::RectList:
+        logged = &logged_rect;
+        limit = 4;
+        break;
+    case AmdGpu::PrimitiveType::QuadList:
+        logged = &logged_quad;
+        limit = 4;
+        break;
+    default:
+        if (!is_ui_draw) {
+            return;
+        }
+        logged = &logged_ui;
+        limit = 8;
+        break;
+    }
+    if (*logged >= limit) {
         return;
     }
-    static u32 logged_direct = 0;
-    static u32 logged_indirect = 0;
-    u32& logged = is_indirect ? logged_indirect : logged_direct;
-    if (logged >= 16) {
-        return;
-    }
-    ++logged;
+    ++(*logged);
 
     const auto scissor = regs.GetCombinedScissor();
     const auto& cb0 = regs.color_buffers[0];
-    const auto& vp = regs.viewports[0];
     const auto& bc = regs.blend_control[0];
 
     LOG_INFO(Render_Vulkan,
-             "SS-list draw prim={} indirect={} idx={} count={} inst={} scissor={},{}-{},{}",
-             static_cast<u32>(key.prim_type), is_indirect, is_indexed, count,
-             regs.num_instances.NumInstances(), static_cast<s32>(scissor.top_left_x),
-             static_cast<s32>(scissor.top_left_y), static_cast<s32>(scissor.bottom_right_x),
-             static_cast<s32>(scissor.bottom_right_y));
-    LOG_INFO(Render_Vulkan, "SS-list target cb0={:#x} fmt={}/{} tile={} vp={:.1f},{:.1f}",
+             "SS-list draw prim={} ind={} idx={} count={} tex={} cb0={:#x} fmt={}/{} "
+             "blend={} depth_en={} scissor={},{}-{},{}",
+             static_cast<u32>(key.prim_type), is_indirect, is_indexed, count, num_textures,
              cb0.Address(), static_cast<u32>(cb0.GetDataFmt()),
-             static_cast<u32>(cb0.GetNumberFmt()), static_cast<u32>(cb0.GetTileMode()), vp.xscale,
-             vp.yscale);
-    LOG_INFO(Render_Vulkan, "SS-list raster depth_en={} depth_fn={} blend={} mrts={}",
-             regs.depth_control.depth_enable, static_cast<u32>(regs.depth_control.depth_func),
-             bc.enable, static_cast<u32>(key.mrt_mask));
+             static_cast<u32>(cb0.GetNumberFmt()), bc.enable, regs.depth_control.depth_enable,
+             static_cast<s32>(scissor.top_left_x), static_cast<s32>(scissor.top_left_y),
+             static_cast<s32>(scissor.bottom_right_x), static_cast<s32>(scissor.bottom_right_y));
 
-    // A screen-space list that is drawn with sane raster state but never shows up almost always
-    // loses its fragments to a texture that was bound with no usable data behind it, so report the
-    // image descriptors the fragment stage will actually sample.
-    const auto& fs = pipeline->GetStage(Shader::SwStage::Fragment);
-    LOG_INFO(Render_Vulkan, "SS-list fs textures={} buffers={}", fs.images.size(),
-             fs.buffers.size());
+    // A quad that reaches the rasterizer with sane state but never shows up usually loses its
+    // fragments to an image descriptor that carries no usable data, so report what it samples.
     u32 tex_index = 0;
     for (const auto& image_desc : fs.images) {
         const auto tsharp = image_desc.GetSharp(fs);
@@ -236,7 +247,7 @@ static void LogScreenSpaceDraw(const AmdGpu::Regs& regs, const GraphicsPipeline*
                  tex_index, tsharp.Address(), static_cast<u32>(tsharp.GetDataFmt()),
                  static_cast<u32>(tsharp.GetNumberFmt()), static_cast<u32>(tsharp.width),
                  static_cast<u32>(tsharp.height));
-        if (++tex_index >= 4) {
+        if (++tex_index >= 3) {
             break;
         }
     }
@@ -258,7 +269,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    LogScreenSpaceDraw(regs, pipeline, is_indexed, false, regs.num_indices);
+    LogHudLikeDraw(regs, pipeline, is_indexed, false, regs.num_indices);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -320,7 +331,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    LogScreenSpaceDraw(liverpool->regs, pipeline, is_indexed, true, max_count);
+    LogHudLikeDraw(liverpool->regs, pipeline, is_indexed, true, max_count);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {

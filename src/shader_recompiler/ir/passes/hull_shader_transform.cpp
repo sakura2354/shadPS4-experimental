@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -415,6 +416,13 @@ static std::optional<u32> TryEvaluateConstU32(IR::Value value, u32 depth = 0) {
 // express that with compile-time IR::Patch indices, so fall back to the edge whose offset lands
 // inside the factor block of the active domain. Hull shaders emit their factors as a run of
 // consecutive dwords whose base the phi selects, so only one edge can start a valid factor block.
+//
+// The selection is not always a bare phi: the guest frequently adds a constant byte offset on top,
+// as in `IAdd32(Phi(0x0, 0xc), 0x4)`, and every factor of a multi-dword store carries the same add.
+// Enumerate the candidate bases at the leaf of such a chain instead of requiring the argument to be
+// a phi straight away, otherwise a store that is perfectly representable still trips the assertion.
+static constexpr u32 MaxFactorEdgeCandidates = 8;
+
 static u32 MaxTessFactorCount(AmdGpu::TessellationType type) {
     switch (type) {
     case AmdGpu::TessellationType::Isoline:
@@ -428,20 +436,97 @@ static u32 MaxTessFactorCount(AmdGpu::TessellationType type) {
     }
 }
 
-static std::optional<u32> TryPickResolvableFactorEdge(IR::Value value, u32 inst_offset,
-                                                      AmdGpu::TessellationType tess_type) {
-    const IR::Inst* inst = value.TryInst();
-    if (inst == nullptr || inst->GetOpcode() != IR::Opcode::Phi) {
-        return std::nullopt;
-    }
-    const u32 factor_count = MaxTessFactorCount(tess_type);
-    for (size_t i = 0; i < inst->NumArgs(); i++) {
-        const auto v = TryEvaluateConstU32(inst->Arg(i));
-        if (v && ((inst_offset + *v) >> 2) < factor_count) {
-            return v;
+// Collect every constant the base of `value` can take, peeling the constant additions that wrap it.
+// Returns false as soon as a non-constant operand appears, because then no edge is enumerable.
+struct FactorEdgeBases {
+    std::array<u32, 8> values{};
+    u32 count{};
+
+    void Push(u32 value) {
+        if (count < values.size()) {
+            values[count++] = value;
         }
     }
-    return std::nullopt;
+};
+
+static bool CollectFactorEdgeBases(IR::Value value, u32 extra, FactorEdgeBases& out,
+                                   u32 depth = 0) {
+    if (depth > 8 || out.count >= MaxFactorEdgeCandidates) {
+        return false;
+    }
+    const IR::Inst* inst = value.TryInst();
+    if (inst == nullptr) {
+        if (value.Type() != IR::Type::U32) {
+            return false;
+        }
+        out.Push(extra + value.U32());
+        return true;
+    }
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::IAdd32: {
+        // Constant additions are folded into `extra` so the leaf constants stay comparable.
+        const auto lhs = TryEvaluateConstU32(inst->Arg(0));
+        const auto rhs = TryEvaluateConstU32(inst->Arg(1));
+        if (lhs) {
+            return CollectFactorEdgeBases(inst->Arg(1), extra + *lhs, out, depth + 1);
+        }
+        if (rhs) {
+            return CollectFactorEdgeBases(inst->Arg(0), extra + *rhs, out, depth + 1);
+        }
+        return false;
+    }
+    case IR::Opcode::ShiftLeftLogical32:
+    case IR::Opcode::IMul32:
+    case IR::Opcode::BitFieldUExtract: {
+        const auto v = TryEvaluateConstU32(value);
+        if (!v) {
+            return false;
+        }
+        out.Push(extra + *v);
+        return true;
+    }
+    case IR::Opcode::Phi: {
+        for (size_t i = 0; i < inst->NumArgs(); i++) {
+            if (!CollectFactorEdgeBases(inst->Arg(i), extra, out, depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    default: {
+        const auto v = TryEvaluateConstU32(value);
+        if (!v) {
+            return false;
+        }
+        out.Push(extra + *v);
+        return true;
+    }
+    }
+}
+
+static std::optional<u32> TryPickResolvableFactorEdge(IR::Value value, u32 inst_offset,
+                                                      AmdGpu::TessellationType tess_type) {
+    const u32 factor_count = MaxTessFactorCount(tess_type);
+    if (factor_count == 0) {
+        return std::nullopt;
+    }
+    FactorEdgeBases candidates;
+    if (!CollectFactorEdgeBases(value, 0, candidates) || candidates.count == 0) {
+        return std::nullopt;
+    }
+    // Prefer the smallest in-range offset so the chosen block starts as early as possible, which
+    // keeps the following factors of a multi-dword store inside the same edge run.
+    std::optional<u32> best;
+    for (u32 i = 0; i < candidates.count; i++) {
+        const u32 candidate = candidates.values[i];
+        if (((inst_offset + candidate) >> 2) >= factor_count) {
+            continue;
+        }
+        if (!best || candidate < *best) {
+            best = candidate;
+        }
+    }
+    return best;
 }
 
 static void DumpIRValue(std::string& out, IR::Value value, u32 depth) {
@@ -541,13 +626,34 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                                     static_cast<u32>(runtime_info.sw.tcs.tess_type));
                     }
                 }
-                ASSERT_MSG(index_value && *index_value == 0 && voffset_value,
-                           "unhandled pattern in tess factor store");
+                // A store we cannot resolve would previously abort the whole emulator over what is
+                // at worst a mis-tessellated patch, so leave the original store untouched and keep
+                // running instead of trading a visual artifact for a crash.
+                if (!index_value || *index_value != 0 || !voffset_value) {
+                    LOG_ERROR(Render_Recompiler,
+                              "Skipping unresolvable tessellation factor store "
+                              "(tess_type={}, inst_offset={:#x})",
+                              static_cast<u32>(runtime_info.sw.tcs.tess_type),
+                              info.inst_offset.Value());
+                    break;
+                }
 
                 const u32 gcn_factor_idx = (info.inst_offset.Value() + *voffset_value) >> 2;
                 const IR::Value data = inst.Arg(IR::StoreBufferArgs::Data);
 
                 const u32 num_dwords = u32(opcode) - u32(IR::Opcode::StoreBufferU32) + 1;
+
+                // A multi-dword store must stay inside the factor block of its domain. Writing past
+                // the end would index an attribute that does not exist, so drop it instead.
+                const u32 factor_count = MaxTessFactorCount(runtime_info.sw.tcs.tess_type);
+                if (factor_count != 0 && gcn_factor_idx + num_dwords > factor_count) {
+                    LOG_ERROR(Render_Recompiler,
+                              "Dropping tessellation factor store past the end of the block "
+                              "(tess_type={}, first_index={}, dwords={})",
+                              static_cast<u32>(runtime_info.sw.tcs.tess_type), gcn_factor_idx,
+                              num_dwords);
+                    break;
+                }
 
                 const auto GetValue = [&](IR::Value data) -> IR::F32 {
                     if (auto* inst = data.TryInst();
