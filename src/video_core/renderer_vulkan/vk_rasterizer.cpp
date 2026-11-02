@@ -200,6 +200,30 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    // Screen-space lists are expanded by an auxiliary tessellation shader. When they fail to
+    // appear the usual causes are the scissor, the depth test or blending, none of which a draw
+    // call alone can show, so log the state of the first few of them.
+    if (const auto& key = pipeline->GetGraphicsKey();
+        key.prim_type == AmdGpu::PrimitiveType::RectList ||
+        key.prim_type == AmdGpu::PrimitiveType::QuadList) {
+        static u32 logged_rect_draws = 0;
+        if (logged_rect_draws < 24) {
+            const auto scissor = regs.GetCombinedScissor();
+            const auto& bc = regs.blend_control[0];
+            LOG_INFO(Render_Vulkan,
+                     "SS-list draw prim={} idx={} count={} inst={} off={:#x} "
+                     "scissor={},{}-{},{} cb={} depth_en={} depth_fn={} blend={} mrts={}",
+                     static_cast<u32>(key.prim_type), is_indexed, regs.num_indices,
+                     regs.num_instances.NumInstances(), regs.index_offset,
+                     static_cast<s32>(scissor.top_left_x), static_cast<s32>(scissor.top_left_y),
+                     static_cast<s32>(scissor.bottom_right_x),
+                     static_cast<s32>(scissor.bottom_right_y),
+                     static_cast<u32>(regs.color_control.mode), regs.depth_control.depth_enable,
+                     static_cast<u32>(regs.depth_control.depth_func), bc.enable, key.mrt_mask);
+            logged_rect_draws++;
+        }
+    }
+
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
