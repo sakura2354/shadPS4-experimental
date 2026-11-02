@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <array>
-
 #include <vulkan/vulkan_format_traits.hpp>
 
 #include "common/debug.h"
@@ -271,43 +268,9 @@ void Rasterizer::LogSampledImageState(const GraphicsPipeline* pipeline) {
     ++logged_state;
 
     const auto tsharp = fs.images[0].GetSharp(fs);
-    VideoCore::TextureCache::ImageDesc desc(tsharp, fs.images[0]);
-    const auto image_id = texture_cache.FindImage(desc);
-    const auto& image = texture_cache.GetImage(image_id);
-    const auto& info = image.info;
-    const bool is_dirty = (image.flags & VideoCore::ImageFlagBits::Dirty) != 0;
-    const bool is_untracked = image.track_addr == 0 || image.track_addr_end == 0;
-
-    LOG_INFO(Render_Vulkan,
-             "SS-list img addr={:#x} fmt={} type={} tiled={} size={}x{}x{} mips={} pitch={} "
-             "gpu_valid={} dirty={} untracked={} guest_size={:#x}",
-             tsharp.Address(), static_cast<u32>(info.pixel_format), static_cast<u32>(info.type),
-             info.IsTiled(), info.size.width, info.size.height, info.size.depth,
-             info.resources.levels, info.pitch, image.HasGpuValidData(), is_dirty, is_untracked,
-             info.guest_size);
-
-    // A texel of R8_UNORM is one byte, so the first row of guest bytes says whether the atlas was
-    // ever filled: an all-zero row samples as transparent black and looks exactly like a dropped
-    // draw. Sample a fixed window instead of a whole row to keep this cheap and allocation free.
-    constexpr u32 SampleBytes = 256;
-    std::array<u8, SampleBytes> window{};
-    u32 non_zero = 0;
-    u32 peak = 0;
-    const u32 pitch = static_cast<u32>(tsharp.pitch);
-    const u32 width = static_cast<u32>(tsharp.width);
-    const u32 window_bytes = std::min(pitch != 0 ? pitch : width, SampleBytes);
-    if (window_bytes != 0 && memory->IsValidGpuMapping(tsharp.Address(), window_bytes)) {
-        memory->CopySparseMemory(tsharp.Address(), window.data(), window_bytes);
-        for (u32 i = 0; i < window_bytes; i++) {
-            const u32 value = static_cast<u32>(window[i]);
-            if (value != 0) {
-                ++non_zero;
-                peak = std::max(peak, value);
-            }
-        }
-    }
-    LOG_INFO(Render_Vulkan, "SS-list img window={} non_zero={} peak={}", window_bytes, non_zero,
-             peak);
+    LOG_INFO(Render_Vulkan, "SS-list img addr={:#x} pitch={} width={} height={} fmt={}",
+             tsharp.Address(), static_cast<u32>(tsharp.pitch), static_cast<u32>(tsharp.width),
+             static_cast<u32>(tsharp.height), static_cast<u32>(tsharp.GetDataFmt()));
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
